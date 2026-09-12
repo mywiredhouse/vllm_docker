@@ -1,0 +1,7 @@
+.git
+.gitignore
+models/
+*.log
+chats/
+specs/
+README.md

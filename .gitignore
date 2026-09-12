@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Model weights and caches (never commit)
+models/
+*.safetensors
+*.gguf
+*.bin
+.cache/
+*.local.tsv
+
+# Build / runtime artifacts
+*.so
+*.log
+.env
+
+# Editor / OS
+.DS_Store
+*.swp
