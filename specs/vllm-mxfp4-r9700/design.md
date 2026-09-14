@@ -109,9 +109,13 @@ qwen-fixed-v22.3.jinja    ──────────→   chat template
                                         Serving on 0.0.0.0:${PORT} inside; mapped to host
 ```
 
-## Components
+## Components and Interfaces
+
+Each component below states its interface as a contract: what it consumes (inputs / env), what it produces (outputs / side effects), and how it signals failure.
 
 ### Component 1: gpu-detect.sh
+
+**Interface** — Consumes: sysfs render nodes, `HIP_VISIBLE_DEVICES` (optional override). Produces (stdout / exported env): usable GPU count, `TP`, `HIP_VISIBLE_DEVICES=0,3`, hardware signature `2x7551-32624`. Fails: non-zero exit with the failing divisibility constraint, or when fewer than two R9700 are usable.
 
 Reads `mem_info_vram_total` from each amdgpu render node under sysfs, excludes devices below 8192 MiB (skips iGPU), counts usable cards, and derives TP as the largest of 8/4/2/1 the usable cards fill.
 
@@ -130,17 +134,25 @@ fi
 
 ### Component 2: setup-mxfp4.sh
 
+**Interface** — Consumes: `MODELS`, `SPEC_METHOD`, `AUTO_R4D`, `R4D_PIN`, selected runtime. Produces: pulled image (digest recorded), source checkpoint, `Qwen3.8-27B-MXFP4-mtpfp8`, optional drafter, cached libr4d, a `ready` report. Idempotent — each step is a no-op when its output already exists.
+
 Idempotent orchestrator. Each step checks for existing state before acting: image present → skip pull; checkpoint present → skip download; `Qwen3.8-27B-MXFP4-mtpfp8` present → skip rewrite; drafter present → skip download; libr4d cached → skip build. Runs the rewrite and kernel build **inside the container** so the host needs no Python, ROCm, or HF CLI. Records the pulled image digest.
 
 ### Component 3: fp8_mtp.py
+
+**Interface** — Consumes: `amd/Qwen3.8-27B-Quark-AWQ-MXFP4` on disk. Produces: `Qwen3.8-27B-MXFP4-mtpfp8` whose `config.json` declares `mxfp4` for the body and `fp8` for the MTP head. Runs inside the container. Verification is metadata-level (config declarations), not numeric.
 
 Runs inside the container. Loads `amd/Qwen3.8-27B-Quark-AWQ-MXFP4`, requantizes the `mtp.*` head to fp8, re-declares it by module-name (so vLLM does not apply mxfp4 to a bf16 head), and writes `Qwen3.8-27B-MXFP4-mtpfp8`. ~15 min. Body stays MXFP4; only the MTP head changes. Verification is metadata-level: config declares mxfp4 for the body and fp8 for the MTP head.
 
 ### Component 4: libr4d build (inside serve/setup)
 
+**Interface** — Consumes: `AUTO_R4D=1`, `R4D_PIN=b9e42ab`, gfx1201 target. Produces: pinned kernel build cached at `~/.cache/radiance-libr4d`. Contract: the serve script verifies the cache before launch and fails loudly if absent — it never falls back to stock kernels.
+
 `AUTO_R4D=1` clones and builds `libr4d` pinned at `R4D_PIN=b9e42ab` for gfx1201, caching at `~/.cache/radiance-libr4d`. The serve script verifies the cache before launching and fails loudly if the pinned build is missing — never silently falls back to the stock (NaN-producing) kernels.
 
 ### Component 5: serve-mxfp4.sh
+
+**Interface** — Consumes: config knobs (table below), detected TP, verified libr4d cache. Produces: a running container serving the mtpfp8 checkpoint on `${PORT}`, or (with `DRY_RUN=1`) the resolved command and env printed with no execution. Fails: non-zero exit if the libr4d cache is missing.
 
 The launcher. Resolves all config knobs as `${VAR:-default}`, sets `RADIANCE_MXFP4=1` and `RADIANCE_MXFP4_W4A8=1`, uses detected TP=2, and assembles the `vllm serve` command with the fixed flags and chat template. Supports `--help` (documents every knob) and `DRY_RUN=1` (prints resolved command and env, executes nothing).
 
@@ -179,19 +191,74 @@ vllm serve "${MODELS}/${SNAP}" \
 
 ### Component 6: serving flags and template (fixed)
 
+**Interface** — Consumes: nothing configurable. Produces: fixed flag set appended to every `vllm serve` invocation. Not knobs.
+
 `--enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3` plus `qwen-fixed-v22.3.jinja` are fixed, not knobs. They match upstream and are required for correct tool-call and reasoning parsing.
 
 ### Component 7: calibrate-kv.sh + kv-profiles.tsv
+
+**Interface** — Consumes: hardware signature, batch shape (`MAXSEQS`/`MAXLEN`/`CHUNK`), a running server. Produces / updates: one row in `kv-profiles.tsv` keyed on (hardware signature, batch shape). Consumed by the launcher when `KV_MEM=auto`. Re-runnable in place; off the first-serve critical path.
 
 Post-first-serve optimization. Determines a safe KV cache size for the hardware signature `2x7551-32624` and the batch shape (`MAXSEQS`/`MAXLEN`/`CHUNK`), writes a row to `kv-profiles.tsv` keyed on both. With `KV_MEM=auto`, the launcher looks up a matching profile and uses it; otherwise it falls back to a conservative auto value. Re-runnable without a fresh clone. Reference target: ~943,581 KV tokens at 262,144 context on 2x R9700.
 
 ### Component 8: docker-compose.yml
 
+**Interface** — Consumes: same device nodes, mounts, and env as `serve-mxfp4.sh`. Produces: the same running container. Optional wrapper, not the primary entry point.
+
 Convenience wrapper for the launcher path (FP8/MXFP4 serve), passing the same device nodes, mounts, and env as `serve-mxfp4.sh`. Not required — the shell launcher is the primary entry point.
 
 ### Component 9: Dockerfile (Option B, fallback)
 
+**Interface** — Consumes: pinned build deps. Produces: a from-source gfx1201 image (`builder` → `rocmprune` → `assemble` → `final`). Not invoked on the first-serve path.
+
 4 stages — `builder`, `rocmprune`, `assemble`, `final` — for build-from-source. Present for completeness and future work. Not exercised on the first-serve path. Documented in README as fallback only.
+
+## Data Models
+
+This stack has no application database. Its persistent "data models" are the on-disk artifacts and the calibration table that the scripts read and write. Three schemas are load-bearing.
+
+### Hardware signature
+
+A string key identifying the GPU configuration for KV calibration and detection. Format:
+
+```
+<count>x<deviceId>-<usableVramMiB>
+```
+
+| Field | Type | Meaning | Target value |
+|-------|------|---------|--------------|
+| `count` | int | Number of usable in-scope cards | `2` |
+| `deviceId` | hex (no `0x`) | PCI device id of the card | `7551` (R9700) |
+| `usableVramMiB` | int | Usable VRAM per card, MiB, from sysfs `mem_info_vram_total` | `32624` |
+
+Target signature: `2x7551-32624`. Produced by `gpu-detect.sh`, consumed by the launcher and `calibrate-kv.sh`.
+
+### kv-profiles.tsv row schema
+
+Tab-separated. One row per (hardware signature, batch shape). The composite key is `hw_sig` + `max_seqs` + `max_len` + `chunk`; `KV_MEM=auto` looks up a row on this key.
+
+| Column | Type | Key? | Meaning |
+|--------|------|------|---------|
+| `hw_sig` | string | key | Hardware signature, e.g. `2x7551-32624` |
+| `max_seqs` | int | key | Batch shape: `MAXSEQS` at calibration |
+| `max_len` | int | key | Batch shape: `MAXLEN` at calibration |
+| `chunk` | int | key | Batch shape: `CHUNK` at calibration |
+| `kv_mem` | string/number | value | Calibrated safe KV cache size for this key |
+| `kv_tokens` | int | value | Achieved KV tokens (reference: ~943581 at 262144 ctx) |
+
+Re-running calibration for an existing key updates that row in place. When no row matches, the launcher delegates KV sizing to vLLM's default auto behaviour.
+
+### Checkpoint config.json quant declarations
+
+Each on-disk checkpoint carries a `config.json` whose quantisation declarations determine how vLLM loads it. The rewrite exists precisely to fix these declarations.
+
+| Checkpoint | Body quant | MTP head quant | Loadable as-is |
+|-----------|-----------|----------------|----------------|
+| `Qwen3.8-27B-Quark-AWQ-MXFP4` (source) | `mxfp4` | bf16, excluded by tensor-name | No — vLLM applies mxfp4 to bf16 head, load dies |
+| `Qwen3.8-27B-MXFP4-mtpfp8` (served) | `mxfp4` | `fp8`, declared by module-name | Yes |
+| `Qwen3.8-27B-DFlash2-FP8` (drafter) | `fp8` | n/a | Yes (drafter only) |
+
+Native MXFP4 is driven by the `quant_method` field in `config.json` (read when `RADIANCE_MXFP4=1`); the launcher therefore passes no `--quantization` flag. Rewrite verification is a check of these `config.json` fields, not a numeric comparison of weights.
 
 ## Data / Model Layout
 
@@ -203,6 +270,66 @@ ${MODELS:-~/models}/
 
 ~/.cache/radiance-libr4d/            # pinned libr4d build (R4D_PIN=b9e42ab)
 ```
+
+## Correctness Properties
+
+*A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+
+This stack is mostly shell orchestration and I/O against real hardware, so most acceptance criteria are verified by the manual playbook (see Testing Strategy). The properties below isolate the pure, input-varying logic — TP arithmetic, device filtering, idempotent orchestration, command assembly, config/kernel invariants, the smoke-test validator, and KV profile lookup — that is worth checking across many generated inputs rather than one example.
+
+### Property 1: TP divides the head counts
+
+*For any* candidate tensor-parallel size TP, the detection logic SHALL accept TP as valid if and only if TP divides each of `num_attention_heads=24`, `linear_num_key_heads=16`, and `linear_num_value_heads=48` (i.e. TP ∈ {1, 2, 4, 8}); on the target 2x R9700 the derived TP SHALL be exactly 2, and any non-dividing TP SHALL be refused with a non-zero exit.
+
+**Validates: Requirements 1.4, 1.6**
+
+### Property 2: sub-threshold GPUs are always excluded
+
+*For any* set of detected render nodes with arbitrary reported VRAM, the usable set produced by detection SHALL contain exactly those devices reporting ≥ 8192 MiB and no device below it, so an iGPU is never counted.
+
+**Validates: Requirements 1.3**
+
+### Property 3: setup is idempotent
+
+*For any* initial on-disk state, applying a setup step (image pull, checkpoint download, MTP rewrite, drafter download, libr4d build) twice SHALL leave the same final state as applying it once, and the second application SHALL perform no work.
+
+**Validates: Requirements 1.8, 3.4, 4.3, 5.2**
+
+### Property 4: the served checkpoint is always the mtpfp8 rewrite
+
+*For any* resolution of the launcher config knobs, the served checkpoint path SHALL resolve to `Qwen3.8-27B-MXFP4-mtpfp8` and SHALL never resolve to the raw source `Qwen3.8-27B-Quark-AWQ-MXFP4`; the served checkpoint's `config.json` SHALL declare `mxfp4` for the body and `fp8` for the MTP head.
+
+**Validates: Requirements 3.2, 3.3, 3.6, 7.1**
+
+### Property 5: the pinned libr4d is always used, never the stock kernels
+
+*For any* state of the kernel cache, the serve script SHALL launch only when the pinned `R4D_PIN=b9e42ab` build is present at `~/.cache/radiance-libr4d`; when it is absent the serve script SHALL exit non-zero and SHALL NOT launch, and it SHALL never fall back to the image's stock libr4d.
+
+**Validates: Requirements 5.3, 5.4, 5.5**
+
+### Property 6: native MXFP4 means no `--quantization` flag
+
+*For any* resolution of the launcher config knobs with `RADIANCE_MXFP4=1`, the assembled `vllm serve` command SHALL contain no `--quantization` argument, and SHALL always include the fixed serving flags (`--enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3`) and the `qwen-fixed-v22.3.jinja` template.
+
+**Validates: Requirements 6.1, 6.4**
+
+### Property 7: DRY_RUN prints exactly what would run, and runs nothing
+
+*For any* resolution of the launcher config knobs, invoking the launcher with `DRY_RUN=1` SHALL print the same `vllm serve` command that a real invocation would execute and SHALL start zero containers.
+
+**Validates: Requirements 6.6**
+
+### Property 8: smoke-test content is non-empty and NaN-free
+
+*For any* completion response body, the smoke-test validator SHALL accept it if and only if `choices[0].message.content` is a non-empty string containing no NaN token; an empty or NaN-bearing body SHALL be rejected and attributed to the pinned libr4d build.
+
+**Validates: Requirements 7.4, 7.6**
+
+### Property 9: KV profile lookup round-trips and stays unique
+
+*For any* hardware signature and batch shape (`MAXSEQS`, `MAXLEN`, `CHUNK`), after calibration upserts a profile for that key, a `KV_MEM=auto` lookup on the same key SHALL return the written KV size, exactly one row SHALL exist for that key regardless of how many times calibration re-runs, and a lookup on an absent key SHALL delegate to vLLM's default auto behaviour.
+
+**Validates: Requirements 9.3, 9.4, 9.5**
 
 ## Error Handling
 
@@ -219,7 +346,20 @@ ${MODELS:-~/models}/
 
 ## Testing Strategy
 
-Manual verification via TEST_PLAYBOOK.md — the stack requires real R9700 hardware, so there are no automated unit tests on the critical path. The playbook gives exact commands with expected outputs:
+The stack requires real R9700 hardware, so the end-to-end path is verified manually via TEST_PLAYBOOK.md. Alongside it, the pure input-varying logic — the same logic the Correctness Properties describe — is covered by a small property-based test suite that needs no GPU. The two layers are complementary: property tests catch logic bugs in detection, command assembly, idempotence, and profile lookup; the playbook confirms the assembled stack actually serves on hardware.
+
+### Property-based tests (no hardware required)
+
+Cover the nine correctness properties. These exercise the extractable pure logic: TP divisibility, VRAM filtering, idempotent step application, checkpoint-path resolution, libr4d cache gating, command assembly, DRY_RUN fidelity, the smoke-test content validator, and KV profile lookup/upsert.
+
+- Pick a property-based testing library for the target language (the scripts' testable logic can be exercised via a Python harness with **Hypothesis**, or a Bats/shell harness driving the functions). Do not hand-roll a generator framework.
+- Each property test SHALL run a minimum of 100 iterations.
+- Each test SHALL be tagged referencing its design property, format: **Feature: vllm-mxfp4-r9700, Property {number}: {property_text}**.
+- Each correctness property SHALL be implemented by a single property-based test.
+
+### Manual verification (TEST_PLAYBOOK.md, on hardware)
+
+The playbook gives exact commands with expected outputs for the parts that touch real GPUs, the registry, and the HTTP server — none of which vary meaningfully with input and so are integration/smoke checks, not property tests:
 
 1. Preflight: `/dev/kfd` + `/dev/dri` present, runtime detected, disk ≥ ~60 GiB, GPU detection reports 2x R9700 → TP=2
 2. Setup idempotency: re-run `setup-mxfp4.sh`, confirm completed steps skip

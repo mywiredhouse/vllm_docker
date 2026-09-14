@@ -80,14 +80,14 @@ The image's stock `libr4d` produces NaNs on this model's gated-delta-net. Buildi
 
 #### Acceptance Criteria
 
-1. WHEN the setup script runs, THE setup script SHALL verify the amdgpu driver exposes `/dev/kfd` and `/dev/dri`, and SHALL fail with an actionable message if either is missing.
-2. WHEN the setup script runs, THE setup script SHALL verify a supported container runtime is present (podman preferred, docker supported) and SHALL report which one it will use.
-3. WHEN GPU detection runs, THE detection logic SHALL read sysfs `mem_info_vram_total` per amdgpu render node and SHALL exclude any device with less than 8192 MiB usable VRAM so the iGPU is skipped.
-4. WHEN GPU detection runs on the target box, THE detection logic SHALL identify exactly two R9700 cards (signature `2x7551-32624`) and SHALL derive TP = 2.
-5. WHERE more than two usable cards are present, THE detection logic SHALL restrict the in-scope selection to the two R9700 cards via `HIP_VISIBLE_DEVICES=0,3` and SHALL NOT attempt TP other than 2.
-6. IF the derived TP does not divide `num_attention_heads=24`, `linear_num_key_heads=16`, AND `linear_num_value_heads=48`, THEN THE detection logic SHALL refuse to proceed and SHALL report the constraint.
-7. WHEN the setup script completes preflight, THE setup script SHALL report the free disk against the ~60 GiB budget and SHALL warn if insufficient.
-8. THE setup script SHALL be idempotent — re-running after a partial or complete setup SHALL detect existing state and skip completed steps.
+1. IF the amdgpu driver does not expose both `/dev/kfd` and `/dev/dri`, THEN THE setup script SHALL exit with a non-zero status and SHALL print which device node is missing.
+2. WHEN the setup script runs, THE setup script SHALL verify a supported container runtime is present (podman preferred, docker supported) and SHALL print the name of the runtime it will use.
+3. WHEN GPU detection runs, THE detection logic SHALL read sysfs `mem_info_vram_total` per amdgpu render node and SHALL exclude every device reporting less than 8192 MiB usable VRAM, so the iGPU is skipped.
+4. WHEN GPU detection runs on the target system, THE detection logic SHALL identify exactly two R9700 cards matching signature `2x7551-32624` and SHALL derive TP = 2.
+5. WHERE more than two usable cards are present, THE detection logic SHALL restrict device selection to the two R9700 cards via `HIP_VISIBLE_DEVICES=0,3` and SHALL set TP = 2.
+6. IF the derived TP does not divide each of `num_attention_heads=24`, `linear_num_key_heads=16`, and `linear_num_value_heads=48`, THEN THE detection logic SHALL exit with a non-zero status and SHALL print the divisibility constraint that failed.
+7. WHEN the setup script completes preflight, THE setup script SHALL print the free disk space in the models directory against the 60 GiB budget and SHALL print a warning WHEN free space is below 60 GiB.
+8. WHEN the setup script is re-run after a partial or complete setup, THE setup script SHALL detect existing state and SHALL skip steps already completed.
 
 ### Requirement 2: Image Acquisition (Launcher Path)
 
@@ -96,10 +96,10 @@ The image's stock `libr4d` produces NaNs on this model's gated-delta-net. Buildi
 #### Acceptance Criteria
 
 1. WHEN image acquisition runs, THE setup script SHALL pull the pinned image `stilldeadcode/vllm-radiance:0.9.3` using the selected runtime.
-2. THE setup script SHALL use the exact pinned tag and SHALL NOT pull `latest` or an unpinned tag.
-3. WHEN the image is already present locally, THE setup script SHALL skip the pull (idempotent).
-4. WHEN image acquisition completes, THE setup script SHALL verify the image is present and record its digest for reproducibility.
-5. THE launcher path SHALL NOT require building an image to run the MXFP4 stack.
+2. WHEN image acquisition runs, THE setup script SHALL pull the exact pinned tag `0.9.3` and SHALL NOT pull `latest` or any other tag.
+3. WHEN the pinned image is already present locally, THE setup script SHALL skip the pull.
+4. WHEN image acquisition completes, THE setup script SHALL verify the pinned image is present locally and SHALL record its image digest.
+5. THE launcher path SHALL reach a running MXFP4 stack without building an image.
 
 ### Requirement 3: Target Checkpoint Download and fp8 MTP Rewrite
 
@@ -112,7 +112,7 @@ The image's stock `libr4d` produces NaNs on this model's gated-delta-net. Buildi
 3. WHEN the rewrite completes, THE rewritten checkpoint SHALL declare the MTP head as fp8 (not bf16) so vLLM does not apply mxfp4 to a bf16 head.
 4. IF the rewritten checkpoint `Qwen3.8-27B-MXFP4-mtpfp8` already exists, THEN THE setup script SHALL skip the rewrite (idempotent).
 5. THE setup script SHALL run the rewrite inside the Container (no host Python or HF CLI required).
-6. WHEN the rewrite completes, THE setup script SHALL verify the output checkpoint is loadable metadata-wise (config declares mxfp4 quant_method for body, fp8 for MTP head).
+6. WHEN the rewrite completes, THE setup script SHALL verify that the rewritten checkpoint's `config.json` declares `mxfp4` as the body quantisation method and `fp8` for the MTP head.
 
 ### Requirement 4: Drafter Download (Speculative Decoding)
 
@@ -135,7 +135,7 @@ The image's stock `libr4d` produces NaNs on this model's gated-delta-net. Buildi
 2. THE kernel build SHALL cache its output at `~/.cache/radiance-libr4d` so subsequent runs skip the build.
 3. WHEN a cached pinned build exists, THE serve script SHALL reuse it and SHALL NOT rebuild.
 4. THE stack SHALL NOT rely on the image's stock `libr4d`, because it NaNs this model's gated-delta-net.
-5. IF the pinned libr4d build fails, THEN THE serve script SHALL fail loudly and SHALL NOT fall back to the stock kernels silently.
+5. IF the pinned libr4d build fails, THEN THE serve script SHALL exit with a non-zero status, SHALL print the build failure, and SHALL NOT fall back to the stock kernels.
 
 ### Requirement 6: Launcher with TP=2 and Fixed Serving Flags
 
@@ -144,7 +144,7 @@ The image's stock `libr4d` produces NaNs on this model's gated-delta-net. Buildi
 #### Acceptance Criteria
 
 1. WHEN the serve launcher runs, THE launcher SHALL set `RADIANCE_MXFP4=1` (native MXFP4, reads `quant_method` from `config.json`) and SHALL NOT pass `--quantization`.
-2. WHEN the serve launcher runs, THE launcher SHALL set `RADIANCE_MXFP4_W4A8=1` (fp8-WMMA W4A8 GEMM) by default, documenting that it changes numerics to W4A8 vs declared W4A4 but is more accurate and 1.47–2.26x faster than aiter.
+2. WHEN the serve launcher runs, THE launcher SHALL set `RADIANCE_MXFP4_W4A8=1` (fp8-WMMA W4A8 GEMM) by default and SHALL document in its help output that this path uses W4A8 numerics rather than the declared W4A4, is more accurate, and is 1.47–2.26x faster than aiter.
 3. WHEN the serve launcher runs, THE launcher SHALL use the detected TP (2 on the target box) and SHALL restrict devices to the two R9700 via `HIP_VISIBLE_DEVICES=0,3`.
 4. WHEN the serve launcher runs, THE launcher SHALL pass the fixed serving flags `--enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3` and the repo chat template `qwen-fixed-v22.3.jinja`.
 5. THE launcher SHALL expose config knobs as `${VAR:-default}`: `MODELS` (~/models), `SNAP` (target checkpoint), `DRAFTER`, `PORT` (8080), `SPEC_METHOD` (dflash), `SPEC` (7), `MAXSEQS` (8), `MAXLEN` (262144), `CHUNK` (8192), `GPU_UTIL` (0.98), `KV_MEM` (auto), `TP`/`GPUS` (auto).
@@ -161,10 +161,10 @@ The image's stock `libr4d` produces NaNs on this model's gated-delta-net. Buildi
 1. WHEN the launcher starts serving, THE server SHALL load `Qwen3.8-27B-MXFP4-mtpfp8` across both R9700 at TP=2 and SHALL begin listening on `${PORT:-8080}`.
 2. WHEN `GET /health` is called after startup, THE server SHALL return HTTP 200.
 3. WHEN `GET /v1/models` is called, THE server SHALL list the served MXFP4 model id.
-4. WHEN a `POST /v1/chat/completions` request is sent, THE server SHALL return a well-formed OpenAI-compatible completion with non-empty, non-NaN content generated on the R9700 cards.
-5. WHEN startup logs are inspected, THE logs SHALL confirm TP=2, native MXFP4 (quant_method from config), the pinned libr4d in use, and per-GPU weight load (~9.4 GiB/GPU as reference).
-6. IF `/v1/chat/completions` returns NaN or empty content, THEN THE operator SHALL treat it as a libr4d failure (Requirement 5) and re-verify the pinned kernel build.
-7. THE smoke test SHALL be a single documented `curl` command with an expected-shape response, executable without external knowledge.
+4. WHEN a `POST /v1/chat/completions` request is sent, THE server SHALL return an OpenAI-compatible completion whose content is non-empty and contains no NaN token.
+5. WHEN startup logs are inspected, THE logs SHALL report TP=2, native MXFP4 (quant_method read from config), the pinned libr4d in use, and per-GPU weight load in GiB.
+6. IF `POST /v1/chat/completions` returns NaN or empty content, THEN THE smoke test SHALL report failure and SHALL reference the pinned libr4d build (Requirement 5) as the probable cause.
+7. THE smoke test SHALL be a single documented `curl` command paired with its expected response shape, runnable without reference to any external document.
 
 ### Requirement 8: Image Strategy Decision (Launcher Path vs Build-From-Source)
 
@@ -186,8 +186,8 @@ The image's stock `libr4d` produces NaNs on this model's gated-delta-net. Buildi
 1. THE KV calibration SHALL be an optimization performed AFTER first-serve, and SHALL NOT be on the critical path to the definition of done.
 2. WHEN calibration runs, THE calibrate step SHALL determine a safe KV cache size for the hardware signature `2x7551-32624` and the batch shape (`MAXSEQS`, `MAXLEN`, `CHUNK`).
 3. WHEN calibration completes, THE result SHALL be written to `kv-profiles.tsv` keyed on hardware signature and batch shape.
-4. WHEN the launcher runs with `KV_MEM=auto`, THE launcher SHALL look up `kv-profiles.tsv` for a matching profile and use it; otherwise it SHALL fall back to a conservative auto value.
-5. THE calibration SHALL be re-runnable and SHALL update the profile without requiring a fresh clone.
+4. WHEN the launcher runs with `KV_MEM=auto`, THE launcher SHALL look up `kv-profiles.tsv` for a profile matching the current hardware signature and batch shape and SHALL use that profile's KV cache size; IF no matching profile exists, THEN THE launcher SHALL delegate KV sizing to vLLM's default auto behaviour.
+5. WHEN calibration is re-run, THE calibrate step SHALL update the matching profile in `kv-profiles.tsv` in place without requiring a fresh clone.
 
 ### Requirement 10: Standalone Repo Integrity
 

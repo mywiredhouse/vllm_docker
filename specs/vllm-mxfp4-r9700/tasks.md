@@ -8,7 +8,11 @@ Path: **Option A** (pull pinned upstream image, patch at start). Build-from-sour
 
 Target only: **MXFP4 Qwen3.8-27B on 2x R9700 at TP=2.** Out of scope: TP≠2, ParoQuant, uncensored variant, build-from-source.
 
-## Phase 1: Reach First Serve (critical path)
+Property-based tests (marked `*`, optional) cover the nine correctness properties from the design against the pure input-varying logic — no GPU required. They are placed on the tasks whose logic they validate. See Notes for the harness convention.
+
+## Tasks
+
+### Phase 1: Reach First Serve (critical path)
 
 - [ ] 1. Host preflight + GPU/TP detection
   - **Files:** `setup-mxfp4.sh` (preflight section), `gpu-detect.sh`
@@ -22,6 +26,16 @@ Target only: **MXFP4 Qwen3.8-27B on 2x R9700 at TP=2.** Out of scope: TP≠2, Pa
     - Report free disk vs ~60 GiB budget; warn if short
   - **Verify:** `./gpu-detect.sh` prints `TP=2`, sig `2x7551-32624`, and exactly two usable R9700; preflight passes on the dev box and fails cleanly when `/dev/kfd` is hidden
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7_
+
+  - [ ]* 1.1 Property test: TP divides the head counts
+    - **Property 1: TP divides the head counts** — for generated candidate TP, detection accepts iff TP ∈ {1,2,4,8} (divides 24, 16, 48); target 2x R9700 derives TP=2; non-dividing TP refused non-zero
+    - Tag: `Feature: vllm-mxfp4-r9700, Property 1: TP divides the head counts`; ≥100 iterations
+    - **Validates: Requirements 1.4, 1.6**
+
+  - [ ]* 1.2 Property test: sub-threshold GPUs are always excluded
+    - **Property 2: sub-threshold GPUs are always excluded** — for generated render-node VRAM sets, the usable set is exactly those ≥ 8192 MiB; iGPU never counted
+    - Tag: `Feature: vllm-mxfp4-r9700, Property 2: sub-threshold GPUs are always excluded`; ≥100 iterations
+    - **Validates: Requirements 1.3**
 
 - [ ] 2. Image acquisition (launcher path)
   - **File:** `setup-mxfp4.sh` (image section)
@@ -61,6 +75,11 @@ Target only: **MXFP4 Qwen3.8-27B on 2x R9700 at TP=2.** Out of scope: TP≠2, Pa
   - **Verify:** `~/.cache/radiance-libr4d` populated with the pinned build; re-run reuses cache; forced build failure exits non-zero with a clear message
   - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5_
 
+  - [ ]* 5.1 Property test: setup is idempotent
+    - **Property 3: setup is idempotent** — for any generated initial on-disk state, applying a setup step (image pull, checkpoint download, MTP rewrite, drafter download, libr4d build) twice yields the same final state as once, and the second application performs no work
+    - Tag: `Feature: vllm-mxfp4-r9700, Property 3: setup is idempotent`; ≥100 iterations
+    - **Validates: Requirements 1.8, 3.4, 4.3, 5.2**
+
 - [ ] 6. Launcher with detected TP=2 and fixed serving flags
   - **Files:** `serve-mxfp4.sh`, `qwen-fixed-v22.3.jinja`
   - **Do:**
@@ -74,6 +93,26 @@ Target only: **MXFP4 Qwen3.8-27B on 2x R9700 at TP=2.** Out of scope: TP≠2, Pa
     - Verify pinned libr4d cache present before launch; fail if missing
   - **Verify:** `DRY_RUN=1 ./serve-mxfp4.sh` prints a command with `--tensor-parallel-size 2`, no `--quantization`, the three fixed parser flags, the chat template, and `RADIANCE_MXFP4=1 RADIANCE_MXFP4_W4A8=1`; `./serve-mxfp4.sh --help` lists all knobs and defaults
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8, 8.2_
+
+  - [ ]* 6.1 Property test: the served checkpoint is always the mtpfp8 rewrite
+    - **Property 4: the served checkpoint is always the mtpfp8 rewrite** — for any knob resolution, the served path resolves to `Qwen3.8-27B-MXFP4-mtpfp8`, never the raw source; its `config.json` declares mxfp4 body + fp8 MTP head
+    - Tag: `Feature: vllm-mxfp4-r9700, Property 4: the served checkpoint is always the mtpfp8 rewrite`; ≥100 iterations
+    - **Validates: Requirements 3.2, 3.3, 3.6, 7.1**
+
+  - [ ]* 6.2 Property test: the pinned libr4d is always used, never the stock kernels
+    - **Property 5: the pinned libr4d is always used, never the stock kernels** — for any kernel-cache state, serve launches only when the `R4D_PIN=b9e42ab` build is present; when absent it exits non-zero, does not launch, and never falls back to stock libr4d
+    - Tag: `Feature: vllm-mxfp4-r9700, Property 5: the pinned libr4d is always used, never the stock kernels`; ≥100 iterations
+    - **Validates: Requirements 5.3, 5.4, 5.5**
+
+  - [ ]* 6.3 Property test: native MXFP4 means no `--quantization` flag
+    - **Property 6: native MXFP4 means no `--quantization` flag** — for any knob resolution with `RADIANCE_MXFP4=1`, the assembled command contains no `--quantization` and always includes the fixed serving flags and `qwen-fixed-v22.3.jinja`
+    - Tag: `Feature: vllm-mxfp4-r9700, Property 6: native MXFP4 means no --quantization flag`; ≥100 iterations
+    - **Validates: Requirements 6.1, 6.4**
+
+  - [ ]* 6.4 Property test: DRY_RUN prints exactly what would run, and runs nothing
+    - **Property 7: DRY_RUN prints exactly what would run, and runs nothing** — for any knob resolution, `DRY_RUN=1` prints the same `vllm serve` command a real invocation would execute and starts zero containers
+    - Tag: `Feature: vllm-mxfp4-r9700, Property 7: DRY_RUN prints exactly what would run, and runs nothing`; ≥100 iterations
+    - **Validates: Requirements 6.6**
 
 - [ ] 7. First serve + /health + /v1/chat/completions smoke test  ← DEFINITION OF DONE
   - **Files:** `serve-mxfp4.sh`, `TEST_PLAYBOOK.md`
@@ -96,7 +135,12 @@ Target only: **MXFP4 Qwen3.8-27B on 2x R9700 at TP=2.** Out of scope: TP≠2, Pa
     ```
   - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7_
 
-## Phase 2: Optimization (after first serve)
+  - [ ]* 7.1 Property test: smoke-test content is non-empty and NaN-free
+    - **Property 8: smoke-test content is non-empty and NaN-free** — for any generated completion body, the validator accepts iff `choices[0].message.content` is a non-empty string with no NaN token; empty/NaN bodies rejected and attributed to the pinned libr4d build
+    - Tag: `Feature: vllm-mxfp4-r9700, Property 8: smoke-test content is non-empty and NaN-free`; ≥100 iterations
+    - **Validates: Requirements 7.4, 7.6**
+
+### Phase 2: Optimization (after first serve)
 
 - [ ] 8. KV cache calibration
   - **Files:** `calibrate-kv.sh`, `kv-profiles.tsv`
@@ -109,7 +153,12 @@ Target only: **MXFP4 Qwen3.8-27B on 2x R9700 at TP=2.** Out of scope: TP≠2, Pa
   - **Verify:** `calibrate-kv.sh` writes/updates a row; a subsequent `KV_MEM=auto` serve logs the profile value; re-run updates in place
   - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5_
 
-## Phase 3: Repo Hygiene and Fallback
+  - [ ]* 8.1 Property test: KV profile lookup round-trips and stays unique
+    - **Property 9: KV profile lookup round-trips and stays unique** — for any hardware sig and batch shape, after calibration upserts a profile, a `KV_MEM=auto` lookup on the same key returns the written size; exactly one row exists per key regardless of re-runs; a lookup on an absent key delegates to vLLM default auto
+    - Tag: `Feature: vllm-mxfp4-r9700, Property 9: KV profile lookup round-trips and stays unique`; ≥100 iterations
+    - **Validates: Requirements 9.3, 9.4, 9.5**
+
+### Phase 3: Repo Hygiene and Fallback
 
 - [ ] 9. Standalone integrity + README (clean-clone build/run/test)
   - **Files:** `README.md`, all scripts
@@ -137,3 +186,32 @@ Target only: **MXFP4 Qwen3.8-27B on 2x R9700 at TP=2.** Out of scope: TP≠2, Pa
 - No image build is required to reach first-serve. Task 10 documents build-from-source but does not implement it.
 - All setup steps are idempotent — re-running after partial setup skips completed work.
 - Out of scope (do not implement): TP=3 or any TP≠2, ParoQuant, the uncensored checkpoint variant, and build-from-source (Option B beyond documentation).
+- Sub-tasks marked `*` are optional property-based tests covering the design's nine Correctness Properties. They exercise pure input-varying logic and need no GPU. Use a Python + Hypothesis harness (or a Bats/shell harness driving the extracted functions) — do not hand-roll a generator. Each runs ≥100 iterations, one test per property, tagged `Feature: vllm-mxfp4-r9700, Property N: ...`. They may be skipped for a faster path to first-serve but should land before the plan is considered complete.
+- Property → task map: P1,P2 → 1.1,1.2 (detection); P3 → 5.1 (idempotent setup steps); P4,P5,P6,P7 → 6.1–6.4 (launcher resolution, libr4d gate, command assembly, DRY_RUN); P8 → 7.1 (smoke validator); P9 → 8.1 (KV profile lookup).
+
+## Task Dependency Graph
+
+The critical path to first-serve is a strict linear chain 1→2→3→4→5→6→7. Task 8 (KV calibration) depends on first-serve (task 7). Tasks 9 and 10 (hygiene, fallback docs) depend on the critical path completing but not on each other. Optional property-test sub-tasks depend on the parent task whose logic they validate.
+
+```json
+{
+  "waves": [
+    { "id": 0, "tasks": ["1"] },
+    { "id": 1, "tasks": ["2", "1.1", "1.2"] },
+    { "id": 2, "tasks": ["3"] },
+    { "id": 3, "tasks": ["4"] },
+    { "id": 4, "tasks": ["5", "5.1"] },
+    { "id": 5, "tasks": ["6", "6.1", "6.2", "6.3", "6.4"] },
+    { "id": 6, "tasks": ["7", "7.1"] },
+    { "id": 7, "tasks": ["8", "9", "10"] },
+    { "id": 8, "tasks": ["8.1"] }
+  ]
+}
+```
+
+Dependency detail:
+
+- `1 → 2 → 3 → 4 → 5 → 6 → 7` — strict critical path, each depends on the prior.
+- `8` depends on `7` (post-first-serve optimization).
+- `9` and `10` depend on the critical path (`7`) completing, and are independent of each other.
+- Property sub-tasks: `1.1`, `1.2` depend on `1`; `5.1` on `5`; `6.1`–`6.4` on `6`; `7.1` on `7`; `8.1` on `8`.
