@@ -58,12 +58,15 @@ def test_setup_container_scopes_gpus_and_skips_bandwidth_probe(tmp_path: Path) -
     result = bash(
         "source 'setup-mxfp4.sh'; RUNTIME_KIND=podman; HIP_VISIBLE_DEVICES=0,3; "
         f"MODELS='{tmp_path / 'models'}'; R4D_CACHE='{tmp_path / 'cache'}'; "
-        "container_args args; printf '%s\\n' \"${args[*]}\"",
+        "container_args args; container_args python_args python; container_args bash_args bash; "
+        "printf '%s\\n' \"${args[*]}\"; printf '%s\\n' \"${python_args[*]}\"; printf '%s\\n' \"${bash_args[*]}\"",
         env={"SETUP_LIB_ONLY": "1"},
     )
     assert result.returncode == 0
     assert "HIP_VISIBLE_DEVICES=0,3" in result.stdout
     assert "RADIANCE_RUN_BWTEST=0" in result.stdout
+    assert "--entrypoint python" in result.stdout
+    assert "--entrypoint bash" in result.stdout
 
 
 @settings(max_examples=100, deadline=None)

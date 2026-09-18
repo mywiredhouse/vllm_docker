@@ -11,7 +11,7 @@ AUTO_R4D=${AUTO_R4D:-1}
 SPEC_METHOD=${SPEC_METHOD:-dflash}
 HF_HOME=${HF_HOME:-${HOME}/.cache/huggingface}
 HF_HUB_CACHE=${HF_HUB_CACHE:-${HF_HOME}/hub}
-HF_CACHE_REPO=${HF_CACHE_REPO:-tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8}
+HF_CACHE_REPO=${HF_CACHE_REPO:-amd/Qwen3.8-27B-Quark-AWQ-MXFP4}
 DISK_BUDGET_GIB=60
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -56,31 +56,51 @@ report_disk() {
 
 container_args() {
     local -n result=$1
+    local entrypoint=${2:-}
+    local user=${3:-}
     result=(run --rm)
     if [[ "$RUNTIME_KIND" == podman ]]; then
         result+=(--userns=keep-id --group-add=keep-groups)
     else
         result+=(--user "$(id -u):$(id -g)")
     fi
+    if [[ -n "$user" ]]; then
+        result+=(--user "$user")
+    fi
     result+=(
         --device /dev/kfd
         --device /dev/dri
-        -v "${MODELS}:/models:rw"
-        -v "${R4D_CACHE}:/r4d-cache:rw"
-        -v "${R4D_CACHE}:/tmp/.cache/radiance-libr4d:rw"
-        -v "${SCRIPT_DIR}:/workspace:ro"
+        -v "${MODELS}:/models:rw,Z"
+        -v "${R4D_CACHE}:/r4d-cache:rw,Z"
+        -v "${R4D_CACHE}:/tmp/.cache/radiance-libr4d:rw,Z"
+        -v "${SCRIPT_DIR}:/workspace:ro,Z"
         -e HOME=/tmp
+        -e HF_HOME=/tmp/huggingface
+        -e HF_HUB_CACHE=/tmp/huggingface/hub
         -e "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0,3}"
         -e RADIANCE_RUN_BWTEST=0
         -e R4D_PIN="$R4D_PIN"
         -e RADIANCE_LIBR4D_CACHE=/r4d-cache
-        "$IMAGE"
     )
+    if [[ -n "$entrypoint" ]]; then
+        result+=(--entrypoint "$entrypoint")
+    fi
+    result+=("$IMAGE")
 }
 
 run_container() {
+    local entrypoint=${1:?container entrypoint is required}
+    shift
     local -a args
-    container_args args
+    container_args args "$entrypoint"
+    "$RUNTIME" "${args[@]}" "$@"
+}
+
+run_container_root() {
+    local entrypoint=${1:?container entrypoint is required}
+    shift
+    local -a args
+    container_args args "$entrypoint" 0
     "$RUNTIME" "${args[@]}" "$@"
 }
 
@@ -172,7 +192,7 @@ download_model() {
         destination=$1
         repo=$2
         if command -v hf >/dev/null 2>&1; then
-            hf download "$repo" --local-dir "$destination" --local-dir-use-symlinks False
+            hf download "$repo" --local-dir "$destination"
         elif command -v huggingface-cli >/dev/null 2>&1; then
             huggingface-cli download "$repo" --local-dir "$destination" --local-dir-use-symlinks False
         else
@@ -214,16 +234,17 @@ build_libr4d() {
         return
     fi
     printf 'Building libr4d pin %s for gfx1201 inside the container\n' "$R4D_PIN"
-    run_container bash -ceu '
+    run_container_root bash -ceu '
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends git
         work=$(mktemp -d)
         trap "rm -rf \"$work\"" EXIT
         git clone https://codeberg.org/StillDeadcode/libr4d.git "$work/libr4d"
         git -C "$work/libr4d" checkout --detach "$R4D_PIN"
-        cmake -S "$work/libr4d" -B "$work/build" \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_ARCHITECTURES=gfx1201
-        cmake --build "$work/build" --parallel "${BUILD_JOBS:-2}"
+        (cd "$work/libr4d" && JOBS="${BUILD_JOBS:-2}" GFX_ARCH=gfx1201 PYTHON=python ./build.sh)
         rm -rf /r4d-cache/*
-        cp -a "$work/build/." /r4d-cache/
+        cp -a "$work/libr4d/r4d.so" /r4d-cache/
         printf "%s\n" "$R4D_PIN" > /r4d-cache/.pin
     ' || fail "libr4d build failed at pin $R4D_PIN; refusing stock-kernel fallback"
     [[ -f "$marker" ]] || fail 'libr4d build returned success but did not create its pinned cache marker'
