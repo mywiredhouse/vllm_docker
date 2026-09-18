@@ -8,6 +8,7 @@ venv/
 # Model weights and caches (never commit)
 models/
 *.safetensors
+.hypothesis/
 *.gguf
 *.bin
 .cache/

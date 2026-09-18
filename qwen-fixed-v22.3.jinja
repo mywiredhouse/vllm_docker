@@ -1,0 +1,6 @@
+{# Qwen fixed template for vLLM. Tool calls remain in the Qwen3 ChatML shape. #}
+{% if messages and messages[0]['role'] == 'system' %}{{ '<|im_start|>system\n' + messages[0]['content'] + '<|im_end|>\n' }}{% set loop_messages = messages[1:] %}{% else %}{% set loop_messages = messages %}{% endif %}
+{% for message in loop_messages %}
+{% if message['role'] == 'user' %}{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}{% elif message['role'] == 'assistant' %}{{ '<|im_start|>assistant\n' }}{% if message.get('reasoning_content') %}{{ '<think>\n' + message['reasoning_content'] + '\n</think>\n' }}{% endif %}{{ message.get('content', '') }}{% if message.get('tool_calls') %}{% for tool_call in message['tool_calls'] %}{{ '\n<|tool_call|>' + tool_call['function']['name'] + '\n' + tool_call['function']['arguments'] + '<|/tool_call|>' }}{% endfor %}{% endif %}{{ '<|im_end|>\n' }}{% elif message['role'] == 'tool' %}{{ '<|im_start|>tool\n' + message['content'] + '<|im_end|>\n' }}{% endif %}
+{% endfor %}
+{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}

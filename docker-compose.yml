@@ -1,0 +1,37 @@
+# Convenience wrapper. setup-mxfp4.sh remains the primary and idempotent path.
+services:
+  vllm-mxfp4:
+    image: stilldeadcode/vllm-radiance:0.9.3
+    container_name: vllm-mxfp4
+    restart: unless-stopped
+    userns_mode: keep-id
+    group_add:
+      - keep-groups
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    environment:
+      HIP_VISIBLE_DEVICES: "${HIP_VISIBLE_DEVICES:-0,3}"
+      RADIANCE_MXFP4: "${RADIANCE_MXFP4:-1}"
+      RADIANCE_MXFP4_W4A8: "${RADIANCE_MXFP4_W4A8:-1}"
+      RADIANCE_LIBR4D_CACHE: /r4d-cache
+    volumes:
+      - "${MODELS:-${HOME}/models}:/models:rw"
+      - "${R4D_CACHE:-${HOME}/.cache/radiance-libr4d}:/r4d-cache:rw"
+      - "./qwen-fixed-v22.3.jinja:/workspace/qwen-fixed-v22.3.jinja:ro"
+    command:
+      - serve
+      - /models/Qwen3.8-27B-MXFP4-mtpfp8
+      - --tensor-parallel-size
+      - "${TP:-2}"
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --reasoning-parser
+      - qwen3
+      - --chat-template
+      - /workspace/qwen-fixed-v22.3.jinja
+      - --port
+      - "${PORT:-8080}"
